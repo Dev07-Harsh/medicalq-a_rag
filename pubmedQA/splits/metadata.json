@@ -1,0 +1,34 @@
+{
+  "created": "2025-12-12T19:52:23.019380",
+  "source": "Official PubMedQA-L (ori_pqal.json)",
+  "total_samples": 1000,
+  "splits": {
+    "train": 702,
+    "dev": 99,
+    "test": 199
+  },
+  "class_distribution": {
+    "train": {
+      "yes": 387,
+      "no": 238,
+      "maybe": 77
+    },
+    "dev": {
+      "yes": 55,
+      "no": 33,
+      "maybe": 11
+    },
+    "test": {
+      "yes": 110,
+      "no": 67,
+      "maybe": 22
+    }
+  },
+  "random_seed": 42,
+  "notes": [
+    "All contexts are indexed for retrieval",
+    "Answers (long_answer, final_decision) are NOT indexed",
+    "Test set is held out for fair evaluation",
+    "Dev set is for hyperparameter tuning"
+  ]
+}
