@@ -53,6 +53,7 @@ from mega_rag.config import (
     GEMINI_MODEL,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
+    OLLAMA_MAX_TOKENS,
     LLM_PROVIDER,
     LLM_AUTO_FALLBACK
 )
@@ -322,17 +323,25 @@ Analyze the evidence and provide your answer. You MUST end with "Final Answer: y
 
 ANSWER:"""
         else:
+            # Non yes/no mode: make the instructions explicit and short-output oriented.
+            # This improves faithfulness for local medical models (e.g., Meditron) when max tokens is high.
             prompt = f"""{system_instruction}
 
-SOURCES:
+SOURCES (use these exact names in citations):
 {source_reference}
 
 EVIDENCE:
 {context}
 
-QUESTION: {question}
+QUESTION:
+{question}
 
-Write a clear answer using ONLY the evidence above. Cite each fact with [Source: Document Name].
+RESPONSE REQUIREMENTS:
+1. Use ONLY information from EVIDENCE. If not supported, say: "The evidence does not cover this."
+2. Be concise and clinical. Prefer 5-12 sentences.
+3. Every sentence that states a medical fact MUST end with a citation in this format: [Source: Document Name]
+4. Do NOT add outside knowledge, mechanisms, dosages, or guidelines unless explicitly present in EVIDENCE.
+5. If evidence conflicts, state the conflict and cite both sources.
 
 ANSWER:"""
 
@@ -498,7 +507,8 @@ class OllamaLLM(BaseLLM):
         model_name: str = OLLAMA_MODEL,
         base_url: str = OLLAMA_BASE_URL,
         temperature: float = 0.25,  # Moderate temp for better maybe detection
-        max_tokens: int = 50  # Reduced: only need short answers for PubMedQA
+        # Default kept conservative for faithfulness; override via OLLAMA_MAX_TOKENS env var.
+        max_tokens: int = OLLAMA_MAX_TOKENS
     ):
         super().__init__()  # Initialize token tracking
         self.model_name = model_name

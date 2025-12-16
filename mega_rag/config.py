@@ -25,6 +25,13 @@ GEMINI_MODEL = "gemini-2.5-flash"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "meditron")  # Medical LLM: 74.9% PubMedQA baseline
 
+# Ollama generation controls
+# NOTE: Some local models (including Meditron) may become less faithful when allowed to generate
+# very long completions. Keep this reasonably small and increase only if needed.
+# Default lowered to speed up evaluation runs and reduce rambling outputs.
+# You can override per-run: export OLLAMA_MAX_TOKENS=800
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "192"))
+
 # =============================================================================
 # DATA INTEGRITY SETTINGS (Critical for valid evaluation)
 # =============================================================================

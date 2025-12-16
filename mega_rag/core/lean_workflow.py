@@ -22,6 +22,7 @@ import re
 from mega_rag.config import RERANK_TOP_K, SEAE_THRESHOLD
 from mega_rag.retrieval.hybrid_retriever import HybridRetriever
 from mega_rag.core.llm import BaseLLM
+import os
 
 
 class LeanRAGState(TypedDict):
@@ -79,21 +80,30 @@ class LeanMEGARAGWorkflow:
         self.enable_query_reformulation = enable_query_reformulation
         self.enable_query_decomposition = enable_query_decomposition
         self.top_k_for_llm = top_k_for_llm  # Max context chunks for general QA
-        self.top_k_for_yes_no = 5  # Use 5 chunks for yes/no (balance signal vs noise)
-        self.min_relevance_score = 0.4  # Threshold for context inclusion
+        # Tuned defaults for PubMedQA: smaller, higher-precision context reduces MAYBE collapse.
+        self.top_k_for_yes_no = 3
+        self.min_relevance_score = 0.3
         self.enable_ensemble = False  # Disabled: too slow with 3 LLM calls
-        self.enable_self_consistency = False  # Disabled: was causing yes→maybe errors
+        # Accuracy-first: self-consistency voting helps stabilize YES/NO/MAYBE on hard cases.
+        # We keep it limited to uncertain retrieval situations.
+        self.enable_self_consistency = True
         
         # Load cross-encoder for question-specific reranking
-        try:
-            from sentence_transformers import CrossEncoder
-            self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        self.cross_encoder = None
+        enable_cross = os.getenv("LEAN_ENABLE_CROSS_ENCODER", "1").strip().lower() not in {"0", "false", "no"}
+        if enable_cross:
+            try:
+                from sentence_transformers import CrossEncoder
+                self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+                if self.debug:
+                    print("[DEBUG] Cross-encoder loaded for context reranking")
+            except Exception as e:
+                self.cross_encoder = None
+                if self.debug:
+                    print(f"[DEBUG] Cross-encoder not available: {e}")
+        else:
             if self.debug:
-                print("[DEBUG] Cross-encoder loaded for context reranking")
-        except Exception as e:
-            self.cross_encoder = None
-            if self.debug:
-                print(f"[DEBUG] Cross-encoder not available: {e}")
+                print("[DEBUG] Cross-encoder disabled via LEAN_ENABLE_CROSS_ENCODER")
         
         # Import query reformulator if enabled
         if enable_query_reformulation:
@@ -493,25 +503,25 @@ Return ONLY the sub-questions, one per line:"""
             # Post-process: ensure Final Answer format for yes/no questions
             answer = self._ensure_final_answer_format(question, answer)
             
-            # Evidence-aware calibration: only override yes→maybe when evidence is highly uncertain
-            # CONSERVATIVE: Don't override yes→no (too risky, often wrong)
+            # Accuracy-first calibration for yes/no/maybe.
+            # We choose a final label based on:
+            #  - the model's initial label
+            #  - evidence strength (top rerank scores, score gap, number of strong chunks)
+            #  - evidence conflict / uncertainty signals
+            #  - explicit negative-evidence signals to improve NO detection
             if self._is_yes_no_question(question):
-                evidence_text = "\n".join(context_chunks)
-                evidence_hint, confidence = self._check_evidence_uncertainty(evidence_text)
-                
-                # Extract current prediction
-                current_pred = "maybe"
-                if "Final Answer: yes" in answer:
-                    current_pred = "yes"
-                elif "Final Answer: no" in answer:
-                    current_pred = "no"
-                
-                # Override yes→maybe when evidence shows uncertainty (1+ patterns)
-                if evidence_hint == "maybe" and confidence >= 1 and current_pred == "yes":
+                current_pred = self._extract_final_answer_label(answer)
+                chosen = self._choose_yes_no_maybe(
+                    question=question,
+                    current_pred=current_pred,
+                    context_chunks=context_chunks,
+                    retrieval_results=state.get("retrieval_results", [])
+                )
+                if chosen != current_pred and chosen in {"yes", "no", "maybe"}:
                     if self.debug:
-                        print(f"[DEBUG CALIBRATE] Uncertainty detected ({confidence} patterns), overriding yes→maybe")
-                    answer = f"Final Answer: maybe"
-                    trace_msgs.append(f"[CALIBRATE] Overrode yes→maybe (confidence={confidence})")
+                        print(f"[DEBUG CALIBRATE] overriding {current_pred}→{chosen}")
+                    answer = f"Final Answer: {chosen}"
+                    trace_msgs.append(f"[CALIBRATE] Overrode {current_pred}→{chosen}")
             
             trace_msgs.append(f"[GENERATE] Evidence-constrained generation (retry={retry_count})")
 
@@ -927,6 +937,213 @@ VERDICT: [PASS or FAIL]"""
             return ('maybe', maybe_count)
         
         return (None, 0)  # Don't return 'no' - too risky for overriding
+
+    def _extract_final_answer_label(self, answer: str) -> str:
+        """Extract normalized label from a 'Final Answer:' string."""
+        m = re.search(r'final\s*answer\s*[:\s]*(yes|no|maybe|unknown)', answer, re.IGNORECASE)
+        if not m:
+            return "unknown"
+        return m.group(1).lower()
+
+    def _maybe_strength(self, evidence_text: str) -> int:
+        """Return an integer representing how strongly evidence suggests MAYBE.
+
+        We distinguish mild hedging (common in abstracts) from stronger signals like
+        explicit conflict, insufficient evidence, or clear calls for more studies.
+
+        Strength scale (heuristic):
+          0 = no MAYBE signal
+          1 = mild/hedging signal
+          2+ = strong inconclusive/insufficient/conflicting signal
+        """
+        evidence_lower = evidence_text.lower()
+
+        # Strong signals: conflict / insufficient evidence / inconclusive
+        strong_patterns = [
+            r'\b(inconclusive|not conclusive|no consensus)\b',
+            r'\b(conflicting results|mixed results|contradictory|heterogeneous results)\b',
+            r'\b(insufficient evidence|limited evidence)\b',
+            r'\b(further research|more studies|more research)\s+(is\s+)?(needed|required)\b',
+            r'\b(results vary|varied results)\b',
+        ]
+
+        # Mild signals: general hedging / conditional language
+        mild_patterns = [
+            r'\b(may|might|could|suggests|appears to|possibly|potentially)\b',
+            r'\b(depends on|depending on|conditional)\b',
+            r'\b(some (studies|evidence|patients)|in some cases)\b',
+            r'\b(not always|not necessarily)\b',
+        ]
+
+        strong = sum(1 for p in strong_patterns if re.search(p, evidence_lower))
+        mild = sum(1 for p in mild_patterns if re.search(p, evidence_lower))
+
+        # Evidence is considered strongly MAYBE if we have at least one strong signal,
+        # or multiple mild signals.
+        if strong >= 1:
+            return 2 + min(2, strong - 1)
+        if mild >= 2:
+            return 1
+        return 0
+
+    def _evidence_signal_scores(self, context_chunks: List[str], retrieval_results: List[dict]) -> dict:
+        """Compute lightweight evidence signals used for YES/NO/MAYBE calibration.
+
+        We intentionally keep this heuristic and local:
+        - do not require additional models
+        - rely on reranking scores if available
+        - fall back gracefully when scores are missing
+
+        Returns a dict with:
+          - top_score
+          - second_score
+          - score_gap
+          - strong_chunks_n
+          - evidence_len
+        """
+        scores: List[float] = []
+        for r in retrieval_results or []:
+            s = r.get("rerank_score", None)
+            if s is None:
+                continue
+            try:
+                scores.append(float(s))
+            except Exception:
+                continue
+
+        scores_sorted = sorted(scores, reverse=True)
+        top_score = scores_sorted[0] if len(scores_sorted) >= 1 else None
+        second_score = scores_sorted[1] if len(scores_sorted) >= 2 else None
+        score_gap = None
+        if top_score is not None and second_score is not None:
+            score_gap = top_score - second_score
+
+        # “Strong” here is relative to the current min_relevance_score.
+        strong_thresh = max(self.min_relevance_score + 0.05, 0.35)
+        strong_chunks_n = sum(1 for s in scores_sorted if s >= strong_thresh)
+
+        evidence_text = "\n".join(context_chunks or [])
+        return {
+            "top_score": top_score,
+            "second_score": second_score,
+            "score_gap": score_gap,
+            "strong_chunks_n": strong_chunks_n,
+            "evidence_len": len(evidence_text),
+        }
+
+    def _negative_evidence_strength(self, evidence_text: str) -> int:
+        """Return a small integer for how strongly evidence suggests NO."""
+        evidence_lower = evidence_text.lower()
+        no_patterns = [
+            r"\bno significant (difference|effect|association|improvement|benefit)\b",
+            r"\bnot significantly (different|associated|improved|effective)\b",
+            r"\b(did not|does not|do not) (show|find|demonstrate|support)\b",
+            r"\b(failed to|unable to) (show|demonstrate|find)\b",
+            r"\bhypothesis (was )?not supported\b",
+            r"\bno (evidence|association|relationship|correlation)\b",
+            r"\bnot (associated|effective|beneficial|superior)\b",
+        ]
+        hits = sum(1 for p in no_patterns if re.search(p, evidence_lower))
+        return min(3, hits)
+
+    def _conflict_strength(self, evidence_text: str) -> int:
+        """Return a small integer for evidence conflict / inconsistency."""
+        evidence_lower = evidence_text.lower()
+
+        # Direct conflict indicators.
+        conflict_patterns = [
+            r"\bconflicting results\b",
+            r"\bmixed results\b",
+            r"\bcontradictory\b",
+            r"\bheterogeneous\b",
+            r"\binconsistent\b",
+            r"\bresults vary\b",
+        ]
+        conflict = sum(1 for p in conflict_patterns if re.search(p, evidence_lower))
+
+        # Coarse polarity clash heuristic: presence of both positive and negative outcome phrases.
+        pos_markers = [
+            r"\bsignificant (increase|improvement|benefit|reduction)\b",
+            r"\bimproved\b",
+            r"\breduced\b",
+            r"\bassociated with\b",
+        ]
+        neg_markers = [
+            r"\bno significant\b",
+            r"\bnot associated\b",
+            r"\bdid not (show|find|demonstrate)\b",
+            r"\bfailed to\b",
+        ]
+        has_pos = any(re.search(p, evidence_lower) for p in pos_markers)
+        has_neg = any(re.search(p, evidence_lower) for p in neg_markers)
+        if has_pos and has_neg:
+            conflict += 1
+
+        return min(3, conflict)
+
+    def _choose_yes_no_maybe(
+        self,
+        question: str,
+        current_pred: str,
+        context_chunks: List[str],
+        retrieval_results: List[dict],
+    ) -> str:
+        """Choose final label with an accuracy-first evidence policy.
+
+        Philosophy:
+        - Prefer YES/NO only when evidence is strong and not conflicting.
+        - Output MAYBE when evidence is weak/unclear/contradictory.
+        - Improve NO by allowing strong negative evidence to flip YES→NO.
+
+        Returns: 'yes'|'no'|'maybe'|current_pred
+        """
+        evidence_text = "\n".join(context_chunks or "")
+        signals = self._evidence_signal_scores(context_chunks=context_chunks, retrieval_results=retrieval_results)
+        maybe_strength = self._maybe_strength(evidence_text)
+        neg_strength = self._negative_evidence_strength(evidence_text)
+        conflict_strength = self._conflict_strength(evidence_text)
+
+        top_score = signals.get("top_score")
+        score_gap = signals.get("score_gap")
+        strong_chunks_n = signals.get("strong_chunks_n", 0)
+
+        if self.debug:
+            print(
+                "[DEBUG CALIBRATE] "
+                f"top_score={top_score} gap={score_gap} strong_chunks_n={strong_chunks_n} "
+                f"maybe_strength={maybe_strength} conflict_strength={conflict_strength} neg_strength={neg_strength} "
+                f"current_pred={current_pred}"
+            )
+
+        # 1) If evidence is conflicting or clearly inconclusive -> MAYBE
+        if conflict_strength >= 1 and maybe_strength >= 1:
+            return "maybe"
+        if conflict_strength >= 2:
+            return "maybe"
+
+        # 2) If evidence is weak (no scores or too few strong chunks) -> MAYBE
+        if top_score is None:
+            # No rerank signal: fall back to uncertainty heuristics.
+            if maybe_strength >= 1:
+                return "maybe"
+            return current_pred
+
+        weak_evidence = (strong_chunks_n == 0)
+        if weak_evidence and maybe_strength >= 1:
+            return "maybe"
+
+        # 3) Negative evidence can override YES → NO when strong.
+        # This addresses the observed YES bias on GT=NO.
+        if current_pred == "yes" and neg_strength >= 2 and maybe_strength == 0:
+            return "no"
+
+        # 4) Promote MAYBE when the model says YES/NO but evidence signals are borderline.
+        if current_pred in {"yes", "no"}:
+            borderline = (strong_chunks_n <= 1) or (score_gap is not None and score_gap < 0.05)
+            if borderline and (maybe_strength >= 1 or conflict_strength >= 1):
+                return "maybe"
+
+        return current_pred
 
     def _is_yes_no_question(self, question: str) -> bool:
         """Detect if question expects yes/no/maybe answer."""
