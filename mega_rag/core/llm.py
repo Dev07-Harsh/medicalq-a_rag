@@ -669,48 +669,70 @@ class GroqLLM(BaseLLM):
         self.max_tokens = max_tokens
         self.base_url = "https://api.groq.com/openai/v1/chat/completions"
 
-        # Rate limiter: track call timestamps in a sliding window
+        # Rate limiter: track both RPM and TPM
         import collections
         self._call_times = collections.deque()
+        self._token_log = collections.deque()  # (timestamp, token_count) for TPM tracking
         self._max_rpm = max_rpm
-        self._min_interval = 60.0 / max_rpm  # ~2.14s between calls at 28 RPM
+        # TPM limits: 8B=6000, 70B=12000
+        self._max_tpm = 5500 if "8b" in model_name else 11000  # Safe margin below limit
+        self._min_interval = 60.0 / max_rpm
 
-        print(f"✓ Groq LLM initialized: {model_name} (rate limit: {max_rpm} RPM)")
+        print(f"✓ Groq LLM initialized: {model_name} (RPM: {max_rpm}, TPM: {self._max_tpm})")
 
-    def _wait_for_rate_limit(self):
-        """Block until we're safe to make the next API call."""
+    def _wait_for_rate_limit(self, estimated_tokens: int = 800):
+        """Block until we're safe to make the next API call (RPM + TPM)."""
         import time as _time
         from mega_rag.utils.logger import get_logger
         log = get_logger("groq")
 
         now = _time.time()
 
-        # Remove calls older than 60 seconds
+        # --- RPM check ---
         while self._call_times and now - self._call_times[0] > 60:
             self._call_times.popleft()
 
-        # If we've hit the RPM limit, wait until the oldest call expires
         if len(self._call_times) >= self._max_rpm:
             wait_until = self._call_times[0] + 60.0
             sleep_time = wait_until - now + 0.1
             if sleep_time > 0:
-                log.info(f"[Rate limit] {len(self._call_times)}/{self._max_rpm} RPM — waiting {sleep_time:.1f}s")
+                log.info(f"[RPM limit] {len(self._call_times)}/{self._max_rpm} — waiting {sleep_time:.1f}s")
+                _time.sleep(sleep_time)
+                now = _time.time()
+
+        # --- TPM check ---
+        while self._token_log and now - self._token_log[0][0] > 60:
+            self._token_log.popleft()
+
+        tokens_used = sum(t for _, t in self._token_log)
+        if tokens_used + estimated_tokens > self._max_tpm:
+            # Wait until enough old tokens expire
+            wait_until = self._token_log[0][0] + 60.0
+            sleep_time = wait_until - now + 0.5
+            if sleep_time > 0:
+                log.info(f"[TPM limit] {tokens_used}/{self._max_tpm} tok used — waiting {sleep_time:.1f}s")
                 _time.sleep(sleep_time)
 
-        # Also enforce minimum interval between consecutive calls
+        # Minimum interval between calls
         if self._call_times:
-            elapsed = now - self._call_times[-1]
+            elapsed = _time.time() - self._call_times[-1]
             if elapsed < self._min_interval:
                 _time.sleep(self._min_interval - elapsed)
 
         self._call_times.append(_time.time())
+
+    def _log_tokens_used(self, token_count: int):
+        """Record tokens used for TPM tracking."""
+        import time as _time
+        self._token_log.append((_time.time(), token_count))
 
     def generate(self, prompt: str) -> str:
         """Generate response from Groq API with rate limiting and logging."""
         from mega_rag.utils.logger import get_logger
         log = get_logger("groq")
 
-        self._wait_for_rate_limit()
+        estimated_tokens = estimate_tokens(prompt) + self.max_tokens
+        self._wait_for_rate_limit(estimated_tokens)
         try:
             response = requests.post(
                 self.base_url,
@@ -742,8 +764,10 @@ class GroqLLM(BaseLLM):
             comp_tok = usage.get("completion_tokens", estimate_tokens(result))
             self._track_usage(prompt_tok, comp_tok)
 
+            total_tok = prompt_tok + comp_tok
+            self._log_tokens_used(total_tok)
             cumulative = self._cumulative_usage.total_tokens
-            log.debug(f"Call #{self._call_count}: {prompt_tok}+{comp_tok}={prompt_tok+comp_tok} tok | cumulative: {cumulative} tok | model: {self.model_name}")
+            log.debug(f"Call #{self._call_count}: {prompt_tok}+{comp_tok}={total_tok} tok | session: {cumulative} tok | model: {self.model_name}")
             return result
 
         except RateLimitError as e:
