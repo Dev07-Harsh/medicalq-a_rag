@@ -680,6 +680,8 @@ class GroqLLM(BaseLLM):
     def _wait_for_rate_limit(self):
         """Block until we're safe to make the next API call."""
         import time as _time
+        from mega_rag.utils.logger import get_logger
+        log = get_logger("groq")
 
         now = _time.time()
 
@@ -690,9 +692,9 @@ class GroqLLM(BaseLLM):
         # If we've hit the RPM limit, wait until the oldest call expires
         if len(self._call_times) >= self._max_rpm:
             wait_until = self._call_times[0] + 60.0
-            sleep_time = wait_until - now + 0.1  # +0.1s buffer
+            sleep_time = wait_until - now + 0.1
             if sleep_time > 0:
-                print(f"  [Rate limit] {len(self._call_times)}/{self._max_rpm} RPM — waiting {sleep_time:.1f}s")
+                log.info(f"[Rate limit] {len(self._call_times)}/{self._max_rpm} RPM — waiting {sleep_time:.1f}s")
                 _time.sleep(sleep_time)
 
         # Also enforce minimum interval between consecutive calls
@@ -704,7 +706,10 @@ class GroqLLM(BaseLLM):
         self._call_times.append(_time.time())
 
     def generate(self, prompt: str) -> str:
-        """Generate response from Groq API with rate limiting."""
+        """Generate response from Groq API with rate limiting and logging."""
+        from mega_rag.utils.logger import get_logger
+        log = get_logger("groq")
+
         self._wait_for_rate_limit()
         try:
             response = requests.post(
@@ -733,17 +738,22 @@ class GroqLLM(BaseLLM):
 
             # Track token usage from response
             usage = data.get("usage", {})
-            self._track_usage(
-                usage.get("prompt_tokens", estimate_tokens(prompt)),
-                usage.get("completion_tokens", estimate_tokens(result)),
-            )
+            prompt_tok = usage.get("prompt_tokens", estimate_tokens(prompt))
+            comp_tok = usage.get("completion_tokens", estimate_tokens(result))
+            self._track_usage(prompt_tok, comp_tok)
+
+            cumulative = self._cumulative_usage.total_tokens
+            log.debug(f"Call #{self._call_count}: {prompt_tok}+{comp_tok}={prompt_tok+comp_tok} tok | cumulative: {cumulative} tok | model: {self.model_name}")
             return result
 
-        except RateLimitError:
+        except RateLimitError as e:
+            log.error(f"RATE LIMIT: {e}")
             raise
         except requests.exceptions.Timeout:
+            log.error("TIMEOUT: Groq request timed out")
             return "Error: Groq request timed out."
         except requests.exceptions.RequestException as e:
+            log.error(f"CONNECTION ERROR: {e}")
             return f"Error connecting to Groq: {str(e)}"
 
     def generate_answer(

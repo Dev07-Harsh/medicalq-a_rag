@@ -705,6 +705,11 @@ def main() -> None:
         _log(f"[SWEEP] complete path={sweep_path}")
         return
 
+    # Setup evaluation logger
+    from mega_rag.utils.logger import get_logger
+    eval_log = get_logger("eval")
+    eval_log.info(f"Starting evaluation: {len(samples)} samples, configs: {[c[0] for c in configs]}")
+
     try:
         for i, s in enumerate(tqdm(samples, desc="Evaluating", unit="sample"), 1):
             q = s["question"]
@@ -857,6 +862,12 @@ def main() -> None:
                         "retrieval_hit_at_k": hit,
                     },
                 }
+
+                # Always log to file (detailed), console only in debug
+                eval_log.debug(
+                    f"[{i}/{len(samples)}] {config_name} | pubid={s['pubid']} | "
+                    f"gt={gt} pred={pred} | {'CORRECT' if is_correct else 'WRONG'} | {out.latency_s:.1f}s"
+                )
 
                 if args.debug:
                     _log(
