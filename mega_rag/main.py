@@ -113,6 +113,17 @@ def index_documents(
 
     print(f"\n--- Total: {len(all_documents)} document chunks ---")
 
+    # Contextual enrichment: add LLM-generated context to each chunk for better retrieval
+    from mega_rag.config import ENABLE_CONTEXTUAL_CHUNKING
+    if ENABLE_CONTEXTUAL_CHUNKING:
+        print("\n[Contextual Retrieval] Generating context for each chunk...")
+        print("  This is a one-time cost at indexing. Uses LLM to make chunks self-contained.")
+        from mega_rag.core.document_processor import DocumentProcessor as DP
+        ctx_processor = DP()
+        all_documents = ctx_processor.add_contextual_descriptions(all_documents)
+        contextualized = sum(1 for d in all_documents if getattr(d, 'contextualized_content', None))
+        print(f"  Contextualized {contextualized}/{len(all_documents)} chunks")
+
     retriever.index_documents(all_documents)
     retriever.save_indices()
 

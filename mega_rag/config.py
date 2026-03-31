@@ -13,24 +13,60 @@ BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 CHROMA_DIR = BASE_DIR / "chroma_db"
 
-# LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
-LLM_AUTO_FALLBACK = True
+# =============================================================================
+# LLM PROVIDER CONFIGURATION
+# =============================================================================
+# Provider priority: Set LLM_PROVIDER to control the primary model.
+# Supported: "gemini", "groq", "ollama", "auto"
+#   - "gemini": Google Gemini API (free tier: 1,500 req/day)
+#   - "groq":   Groq Cloud API (free tier: 14,400 req/day, ultra-fast)
+#   - "ollama": Local models via Ollama (no API needed)
+#   - "auto":   Smart fallback chain: Gemini → Groq → Ollama
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto")
 
-# Gemini API Configuration
+# Auto-fallback: When primary hits rate limits or errors, try next provider
+LLM_AUTO_FALLBACK = os.getenv("LLM_AUTO_FALLBACK", "true").lower() == "true"
+
+# Fallback chain order (comma-separated). Only used when LLM_AUTO_FALLBACK=True
+# Providers are tried in order; failed/unavailable ones are skipped.
+LLM_FALLBACK_CHAIN = os.getenv("LLM_FALLBACK_CHAIN", "gemini,groq,ollama").split(",")
+
+# =============================================================================
+# GEMINI CONFIGURATION (Google AI Studio - Free Tier)
+# =============================================================================
+# Free tier: 15 RPM, 1,500 RPD, 1M TPM
+# Get API key: https://aistudio.google.com/apikey
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"  
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-# Ollama Configuration (Local Models)
+# =============================================================================
+# GROQ CONFIGURATION (GroqCloud - Free Tier)
+# =============================================================================
+# Free tier: 30 RPM, 14,400 RPD, 6,000 TPM
+# Get API key: https://console.groq.com/keys
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Available free models:
+#   - "llama-3.3-70b-versatile"       (best quality, 6K TPM)
+#   - "deepseek-r1-distill-llama-70b" (strong reasoning)
+#   - "llama-3.1-8b-instant"          (fastest, 6K TPM)
+#   - "gemma2-9b-it"                  (good balance, 15K TPM)
+#   - "mixtral-8x7b-32768"            (32K context, 5K TPM)
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "1024"))
+
+# =============================================================================
+# OLLAMA CONFIGURATION (Local Models)
+# =============================================================================
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "meditron")  # Medical LLM: 74.9% PubMedQA baseline
-
-# Ollama generation controls
-# NOTE: Some local models (including Meditron) may become less faithful when allowed to generate
-# very long completions. Keep this reasonably small and increase only if needed.
-# Default lowered to speed up evaluation runs and reduce rambling outputs.
-# You can override per-run: export OLLAMA_MAX_TOKENS=800
-OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "192"))
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "meditron")
+# Recommended local models (sorted by quality, all fit 8GB RAM with Q4):
+#   - "meditron"       (7B, medical-specific, 74.9% PubMedQA baseline)
+#   - "biomistral"     (7B, PubMed-trained)
+#   - "llama3.1:8b"    (8B, best general reasoning)
+#   - "phi4-mini"      (3.8B, great for limited RAM)
+#   - "qwen2.5:7b"     (7B, strong multilingual)
+#   - "gemma2:2b"      (2.6B, ultra-lightweight)
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "512"))
 
 # =============================================================================
 # DATA INTEGRITY SETTINGS (Critical for valid evaluation)
@@ -53,7 +89,16 @@ GPU_BATCH_SIZE = 2
 # Chunking Configuration
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
-SEMANTIC_THRESHOLD_PERCENTILE = 95  
+SEMANTIC_THRESHOLD_PERCENTILE = 95
+
+# =============================================================================
+# CONTEXTUAL RETRIEVAL (Anthropic-inspired)
+# =============================================================================
+# Prepend a short LLM-generated context to each chunk before embedding.
+# This makes chunks self-contained and improves retrieval by up to 67%.
+# The context is used only for embedding — the raw chunk is shown to the LLM.
+# Ref: https://www.anthropic.com/news/contextual-retrieval
+ENABLE_CONTEXTUAL_CHUNKING = os.getenv("ENABLE_CONTEXTUAL_CHUNKING", "true").lower() == "true"
 
 # Retrieval Configuration
 VECTOR_TOP_K = 30  
@@ -88,16 +133,23 @@ COT_ENSEMBLE_REFINEMENT = True  # Refine answer using ensemble of paths
 # SELF-CONSISTENCY VOTING (Hallucination Reduction)
 # =============================================================================
 # Key technique from Self-RAG and Medprompt papers
-ENABLE_SELF_CONSISTENCY = True  # Enable self-consistency voting for yes/no questions
-SELF_CONSISTENCY_NUM_PATHS = 3  # Number of reasoning paths (higher = more robust, slower)
+# NOTE: Each path = 1 extra LLM call. With Groq 28 RPM, 3 paths means ~3x slower.
+# Set to False or reduce paths when running large evaluations with rate-limited APIs.
+ENABLE_SELF_CONSISTENCY = os.getenv("ENABLE_SELF_CONSISTENCY", "true").lower() == "true"
+SELF_CONSISTENCY_NUM_PATHS = int(os.getenv("SELF_CONSISTENCY_NUM_PATHS", "3"))
 SELF_CONSISTENCY_MIN_AGREEMENT = 0.5  # Minimum agreement for confident answer
 
 # Citation Verification
-ENABLE_CITATION_VERIFICATION = True  # Verify citations against evidence post-generation
+ENABLE_CITATION_VERIFICATION = os.getenv("ENABLE_CITATION_VERIFICATION", "true").lower() == "true"
 
 # Graph Configuration
 GRAPH_SIMILARITY_THRESHOLD = 0.60  
 SPACY_MODEL = "en_core_web_sm"  # Standard model for entity extraction (Neural Linking)
+# Use scispaCy for biomedical NER when available (better medical entity extraction)
+# Install: pip install scispacy && pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz
+# Falls back to en_core_web_sm if not installed
+SPACY_MODEL_BIOMEDICAL = os.getenv("SPACY_MODEL_BIOMEDICAL", "en_core_sci_lg")
+ENABLE_BIOMEDICAL_NER = os.getenv("ENABLE_BIOMEDICAL_NER", "true").lower() == "true"
 
 # Collection name for ChromaDB
 COLLECTION_NAME = "mega_rag_medical"

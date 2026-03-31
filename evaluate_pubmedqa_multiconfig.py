@@ -398,6 +398,28 @@ def main() -> None:
         pred = _extract_decision_pubmedqa(ans)
         return RunOutput(answer_text=raw, predicted=pred, latency_s=time.time() - t0)
 
+    def run_oracle_context(q: str, gold_contexts: List[str] = None) -> RunOutput:
+        """Oracle context: use the provided PubMedQA contexts directly (no retrieval).
+        This is the standard PubMedQA evaluation setting used by the leaderboard.
+        """
+        t0 = time.time()
+        contexts = gold_contexts or []
+        context_block = "\n\n".join([f"[Context {i+1}] {c}" for i, c in enumerate(contexts)])
+        prompt = (
+            "You are answering a PubMedQA-style medical research question using ONLY the provided contexts.\n"
+            "If the contexts do not support a confident yes/no, choose maybe.\n"
+            "Constraints:\n"
+            "- Use at most 2 short sentences of reasoning.\n"
+            "- Then output exactly one final line: Final Answer: yes|no|maybe\n"
+            "- Do not output anything after the Final Answer line.\n\n"
+            f"Contexts:\n{context_block}\n\n"
+            f"Question: {q}\n"
+        )
+        raw = _run_with_optional_timeout(prompt)
+        ans = _normalize_to_final_answer(q, raw)
+        pred = _extract_decision_pubmedqa(ans)
+        return RunOutput(answer_text=raw, predicted=pred, latency_s=time.time() - t0)
+
     def _run_retriever_only(q: str, which: str) -> Tuple[str, List[str]]:
         # Returns (answer_text, contexts_used). We generate with LLM using retrieved contexts.
         if which == "vector_only":
@@ -537,6 +559,7 @@ def main() -> None:
 
     configs: List[Tuple[str, Any]] = [
         ("llm_only", run_llm_only),
+        ("oracle_context", run_oracle_context),
         ("vector_only", run_vector_only),
         ("bm25_only", run_bm25_only),
         ("graph_only", run_graph_only),
@@ -756,7 +779,10 @@ def main() -> None:
                 gold_contexts = s.get("contexts") or []
 
                 try:
-                    out: RunOutput = runner(q)
+                    if config_name == "oracle_context":
+                        out: RunOutput = runner(q, gold_contexts=gold_contexts)
+                    else:
+                        out: RunOutput = runner(q)
                 except Exception as e:
                     # Record failure but keep going.
                     _log(f"ERROR config={config_name} pubid={s['pubid']} err={e}\n{traceback.format_exc()}")
@@ -876,13 +902,31 @@ def main() -> None:
 
             # Prediction distribution (helps explain low scores)
             pred_counts = {"yes": 0, "no": 0, "maybe": 0, "unknown": 0}
+            gt_list = []
+            pred_list = []
             for r in per_sample:
                 pr = r.get("runs", {}).get(config_name, {}).get("predicted")
                 if pr in pred_counts:
                     pred_counts[pr] += 1
                 else:
                     pred_counts["unknown"] += 1
+                gt_list.append(r.get("ground_truth", "unknown"))
+                pred_list.append(pr or "unknown")
             agg["pred_counts"] = pred_counts
+
+            # Macro-F1 (required for PubMedQA publication)
+            labels = ["yes", "no", "maybe"]
+            per_class_f1 = {}
+            for label in labels:
+                tp = sum(1 for g, p in zip(gt_list, pred_list) if g == label and p == label)
+                fp = sum(1 for g, p in zip(gt_list, pred_list) if g != label and p == label)
+                fn = sum(1 for g, p in zip(gt_list, pred_list) if g == label and p != label)
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                per_class_f1[label] = round(f1, 4)
+            agg["per_class_f1"] = per_class_f1
+            agg["macro_f1"] = round(sum(per_class_f1.values()) / len(per_class_f1), 4)
 
             # verifier stats (only meaningful when verifier exists)
             verifier_vals = [
@@ -915,8 +959,9 @@ def main() -> None:
     else:
         for name, _ in configs:
             agg = results_by_config[name]
+            f1_str = f" F1={agg.get('macro_f1', 0):.3f}" if "macro_f1" in agg else ""
             print(
-                f"{name:14s} acc={agg['accuracy']:.3f} cov={agg['coverage']:.3f} "
+                f"{name:16s} acc={agg['accuracy']:.3f}{f1_str} cov={agg['coverage']:.3f} "
                 f"avg_latency={agg['avg_latency_s']:.2f}s unknown={agg['unknown']}"
             )
     print(f"\nSaved report: {args.out}")

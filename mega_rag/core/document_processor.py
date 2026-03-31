@@ -18,6 +18,7 @@ from mega_rag.config import (
     CHUNK_OVERLAP,
     SEMANTIC_THRESHOLD_PERCENTILE,
     EMBEDDING_MODEL,
+    ENABLE_CONTEXTUAL_CHUNKING,
     USE_GPU,
     GPU_BATCH_SIZE
 )
@@ -50,6 +51,7 @@ class Document:
     metadata: dict
     doc_id: str
     chunk_id: int
+    contextualized_content: Optional[str] = None  # Content with prepended context for embedding
 
 
 # Global model instance to avoid loading multiple times
@@ -368,6 +370,81 @@ class DocumentProcessor:
                 chunk_id=i
             )
             documents.append(doc)
+
+        return documents
+
+    def add_contextual_descriptions(self, documents: List[Document]) -> List[Document]:
+        """
+        Add contextual descriptions to chunks for better retrieval (Anthropic-style).
+
+        For each chunk, generates a short context describing what it covers
+        within its source document. The context is prepended to the chunk content
+        and stored in `contextualized_content` — used for embedding only.
+        The original `content` stays unchanged (used for display/generation).
+
+        This reduces retrieval errors by up to 67% by making chunks self-contained.
+        Ref: https://www.anthropic.com/news/contextual-retrieval
+        """
+        if not ENABLE_CONTEXTUAL_CHUNKING:
+            print("  Contextual chunking disabled, skipping")
+            return documents
+
+        if not documents:
+            return documents
+
+        from mega_rag.core.llm import create_llm
+        llm = create_llm()
+
+        # Group documents by source for better context
+        by_source = {}
+        for doc in documents:
+            source = doc.metadata.get("filename", doc.doc_id)
+            by_source.setdefault(source, []).append(doc)
+
+        total = len(documents)
+        done = 0
+
+        for source_name, source_docs in by_source.items():
+            # Build a brief summary of the full document (from first + last chunks)
+            doc_preview_parts = []
+            preview_docs = source_docs[:3] + source_docs[-2:] if len(source_docs) > 5 else source_docs
+            for d in preview_docs:
+                doc_preview_parts.append(d.content[:200])
+            doc_preview = "\n---\n".join(doc_preview_parts)
+
+            clean_name = source_name.replace(".pdf", "").replace("_", " ")
+
+            for doc in source_docs:
+                page_info = ""
+                page = doc.metadata.get("page")
+                if page:
+                    page_info = f", page {page}"
+
+                prompt = (
+                    f"Document: \"{clean_name}\"{page_info}\n\n"
+                    f"Document overview (excerpts):\n{doc_preview[:600]}\n\n"
+                    f"Chunk to contextualize:\n{doc.content[:500]}\n\n"
+                    "Write a 1-2 sentence context for this chunk. "
+                    "State what specific topic, finding, or section this chunk covers "
+                    "within the document. Be factual and specific. "
+                    "Do NOT summarize the chunk content itself — just describe its context."
+                )
+
+                try:
+                    context = llm.generate(prompt).strip()
+                    # Remove any markdown or quotes the LLM might add
+                    context = context.strip('"\'`').strip()
+                    # Limit length
+                    if len(context) > 300:
+                        context = context[:297] + "..."
+                    doc.contextualized_content = f"[Context: {context}]\n\n{doc.content}"
+                except Exception as e:
+                    print(f"  Warning: contextual generation failed for chunk {doc.chunk_id}: {e}")
+                    doc.contextualized_content = doc.content
+
+                done += 1
+                if done % 20 == 0 or done == total:
+                    print(f"  Contextualized {done}/{total} chunks...")
 
         return documents
 

@@ -114,13 +114,20 @@ class MEGARAGWorkflow:
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow."""
+        """Build the LangGraph workflow.
+
+        Flow (v3.0 with CRAG):
+          guardrail → reformulate → retrieve → evaluate_retrieval →
+            (if good) → generate → verify_citations → audit → ...
+            (if bad)  → re_retrieve → generate → ...
+        """
         workflow = StateGraph(RAGState)
 
         # Add nodes
         workflow.add_node("guardrail", self._guardrail_node)
-        workflow.add_node("reformulate", self._reformulate_node)  # New v2.0 node
+        workflow.add_node("reformulate", self._reformulate_node)
         workflow.add_node("retrieve", self._retrieve_node)
+        workflow.add_node("evaluate_retrieval", self._evaluate_retrieval_node)  # CRAG
         workflow.add_node("generate", self._generate_node)
         workflow.add_node("verify_citations", self._verify_citations_node)
         workflow.add_node("audit", self._audit_node)
@@ -130,20 +137,31 @@ class MEGARAGWorkflow:
 
         # Add edges
         workflow.set_entry_point("guardrail")
-        
+
         # Conditional edge from guardrail
         workflow.add_conditional_edges(
             "guardrail",
             self._check_intent,
             {
-                "medical": "reformulate",  # Go to reformulate first for medical queries
+                "medical": "reformulate",
                 "greeting": "finalize",
                 "off_topic": "finalize"
             }
         )
 
-        workflow.add_edge("reformulate", "retrieve")  # Then to retrieve
-        workflow.add_edge("retrieve", "generate")
+        workflow.add_edge("reformulate", "retrieve")
+        workflow.add_edge("retrieve", "evaluate_retrieval")  # CRAG evaluation
+
+        # CRAG: if retrieval quality is poor, re-retrieve before generating
+        workflow.add_conditional_edges(
+            "evaluate_retrieval",
+            self._check_retrieval_quality,
+            {
+                "good": "generate",
+                "poor": "re_retrieve",
+            }
+        )
+
         workflow.add_edge("generate", "verify_citations")
         workflow.add_edge("verify_citations", "audit")
 
@@ -277,6 +295,104 @@ class MEGARAGWorkflow:
             "timing": timing,
             "workflow_trace": trace_msgs
         }
+
+    def _evaluate_retrieval_node(self, state: RAGState) -> RAGState:
+        """CRAG: Evaluate retrieval quality BEFORE generation.
+
+        Scores each retrieved chunk for relevance using the cross-encoder reranker.
+        If most chunks score poorly, triggers re-retrieval with a reformulated query
+        rather than generating from bad evidence (which causes hallucination).
+
+        Ref: "Corrective Retrieval Augmented Generation" (Yan et al., 2024)
+        """
+        start_time = time.time()
+        context_chunks = state.get("context_chunks", [])
+        question = state["question"]
+        trace_msgs = []
+
+        if not context_chunks:
+            trace_msgs.append("[CRAG] No chunks retrieved — will attempt re-retrieval")
+            elapsed = time.time() - start_time
+            timing = state.get("timing", {})
+            timing["evaluate_retrieval"] = elapsed
+            return {**state, "retrieval_quality": "poor", "timing": timing, "workflow_trace": trace_msgs}
+
+        # Use cross-encoder to score relevance of top chunks
+        try:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            import torch
+
+            # Reuse the retriever's cross-encoder if available
+            reranker = getattr(self.retriever, '_cross_encoder', None)
+            if reranker is None:
+                from mega_rag.config import CROSS_ENCODER_MODEL
+                from sentence_transformers import CrossEncoder
+                reranker = CrossEncoder(CROSS_ENCODER_MODEL, device="cpu")
+
+            # Score top chunks
+            pairs = [(question, chunk[:512]) for chunk in context_chunks[:10]]
+            scores = reranker.predict(pairs)
+
+            avg_score = float(sum(scores)) / len(scores) if scores else 0.0
+            high_relevance = sum(1 for s in scores if s > 0.5)
+            total_scored = len(scores)
+
+            trace_msgs.append(f"[CRAG] Retrieval quality: avg_score={avg_score:.3f}, "
+                            f"{high_relevance}/{total_scored} chunks above threshold")
+
+            # Decision: if less than 30% of chunks are relevant, retrieval is poor
+            if high_relevance < total_scored * 0.3 and avg_score < 0.3:
+                quality = "poor"
+                trace_msgs.append("[CRAG] Retrieval quality LOW — triggering corrective re-retrieval")
+            else:
+                quality = "good"
+                trace_msgs.append("[CRAG] Retrieval quality OK — proceeding to generation")
+
+                # Filter out clearly irrelevant chunks (score < 0.1)
+                filtered_chunks = []
+                filtered_metadata = []
+                source_metadata = state.get("source_metadata", [])
+                for i, (chunk, score) in enumerate(zip(context_chunks[:len(scores)], scores)):
+                    if score > 0.1:
+                        filtered_chunks.append(chunk)
+                        if i < len(source_metadata):
+                            filtered_metadata.append(source_metadata[i])
+
+                # Add any chunks that weren't scored
+                filtered_chunks.extend(context_chunks[len(scores):])
+                filtered_metadata.extend(source_metadata[len(scores):])
+
+                if len(filtered_chunks) < len(context_chunks):
+                    removed = len(context_chunks) - len(filtered_chunks)
+                    trace_msgs.append(f"[CRAG] Filtered {removed} irrelevant chunks")
+                    context_chunks = filtered_chunks
+                    source_metadata = filtered_metadata
+
+        except Exception as e:
+            # If cross-encoder fails, assume retrieval is OK and proceed
+            quality = "good"
+            trace_msgs.append(f"[CRAG] Cross-encoder evaluation skipped ({e})")
+            source_metadata = state.get("source_metadata", [])
+
+        elapsed = time.time() - start_time
+        timing = state.get("timing", {})
+        timing["evaluate_retrieval"] = elapsed
+
+        return {
+            **state,
+            "context_chunks": context_chunks,
+            "source_metadata": source_metadata,
+            "retrieval_quality": quality,
+            "timing": timing,
+            "workflow_trace": trace_msgs,
+        }
+
+    def _check_retrieval_quality(self, state: RAGState) -> str:
+        """Route based on CRAG retrieval quality assessment."""
+        quality = state.get("retrieval_quality", "good")
+        if quality == "poor" and not state.get("re_retrieval_done", False):
+            return "poor"
+        return "good"
 
     def _retrieve_node(self, state: RAGState) -> RAGState:
         """Retrieve relevant context using Tri-Brid retrieval with timing."""

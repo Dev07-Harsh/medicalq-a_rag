@@ -46,16 +46,27 @@ class GraphRetriever:
         self.doc_contents: Dict[str, str] = {}
         self.doc_metadatas: Dict[str, dict] = {}
 
-        # Load standard spaCy model for entity extraction
-        print(f"Loading spaCy model: {SPACY_MODEL}...")
-        try:
+        # Load NLP model: prefer scispaCy biomedical model, fall back to general
+        from mega_rag.config import ENABLE_BIOMEDICAL_NER, SPACY_MODEL_BIOMEDICAL
+        self._nlp_model_name = SPACY_MODEL
+        if ENABLE_BIOMEDICAL_NER:
+            try:
+                self.nlp = spacy.load(SPACY_MODEL_BIOMEDICAL)
+                self._nlp_model_name = SPACY_MODEL_BIOMEDICAL
+                print(f"  Using biomedical NER: {SPACY_MODEL_BIOMEDICAL}")
+            except OSError:
+                print(f"  Biomedical model {SPACY_MODEL_BIOMEDICAL} not found, falling back to {SPACY_MODEL}")
+                self.nlp = spacy.load(SPACY_MODEL)
+        else:
             self.nlp = spacy.load(SPACY_MODEL)
-            # Add pipe for merging noun chunks to get better medical terms (e.g., "blood pressure")
-            if "merge_noun_chunks" not in self.nlp.pipe_names:
+
+        # Add noun chunk merging if not already present
+        if "merge_noun_chunks" not in self.nlp.pipe_names:
+            try:
                 self.nlp.add_pipe("merge_noun_chunks")
-        except OSError:
-            print(f"Model {SPACY_MODEL} not found. please run: python -m spacy download {SPACY_MODEL}")
-            raise
+            except Exception:
+                pass  # Some scispaCy models don't support this
+        print(f"  NER model loaded: {self._nlp_model_name}")
 
         # Embedding model for entity similarity (Neural Linking)
         print(f"Loading Neural Linking model: {embedding_model}")
@@ -82,6 +93,17 @@ class GraphRetriever:
             # Filter out short/trivial chunks
             if len(chunk_text) > 3 and not chunk_text.isnumeric():
                 entities.add(chunk_text)
+
+        # 3. Detect medical terms via pattern matching (drug names, conditions, etc.)
+        medical_patterns = [
+            r'\b\d+\s*(?:mg|mcg|ml|mmol|mmHg|kg)\b',  # Dosages
+            r'\b(?:ACE|ARB|CCB|NSAID|SSRI|PPI|HRT)\b',  # Drug class abbreviations
+        ]
+        for pattern in medical_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                matched = match.group().lower().strip()
+                if len(matched) > 2:
+                    entities.add(matched)
 
         return entities
 

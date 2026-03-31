@@ -116,6 +116,14 @@ def main() -> None:
     retriever.bm25_retriever = BM25Retriever(index_path=bm25_path)
     retriever.graph_retriever = GraphRetriever(graph_path=graph_path)
 
+    # Contextual enrichment (if enabled)
+    from mega_rag.config import ENABLE_CONTEXTUAL_CHUNKING
+    if ENABLE_CONTEXTUAL_CHUNKING:
+        from mega_rag.core.document_processor import DocumentProcessor
+        print(f"[INDEX] Adding contextual descriptions to {len(documents)} chunks...")
+        processor = DocumentProcessor()
+        documents = processor.add_contextual_descriptions(documents)
+
     retriever.index_documents(documents)
     retriever.save_indices()
 

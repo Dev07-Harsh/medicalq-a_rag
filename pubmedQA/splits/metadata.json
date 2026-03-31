@@ -1,34 +1,22 @@
 {
-  "created": "2025-12-12T19:52:23.019380",
-  "source": "Official PubMedQA-L (ori_pqal.json)",
+  "created": "2026-04-01T02:01:07.165625",
+  "protocol": "Official PubMedQA benchmark (Jin et al. 2019)",
+  "source": "ori_pqal.json + test_ground_truth.json",
   "total_samples": 1000,
   "splits": {
-    "train": 702,
-    "dev": 99,
-    "test": 199
+    "train": 450,
+    "train_balanced": 141,
+    "train_oversampled": 446,
+    "dev": 50,
+    "test": 500
   },
-  "class_distribution": {
-    "train": {
-      "yes": 387,
-      "no": 238,
-      "maybe": 77
-    },
-    "dev": {
-      "yes": 55,
-      "no": 33,
-      "maybe": 11
-    },
-    "test": {
-      "yes": 110,
-      "no": 67,
-      "maybe": 22
-    }
+  "test_note": "Official fixed 500-sample test set from pubmedqa.github.io",
+  "balanced_note": "Undersampled to 47/class for unbiased fine-tuning",
+  "oversampled_note": "Oversampled minority classes to 249/class",
+  "metrics": "Accuracy + Macro-F1 (both required for publication)",
+  "evaluation_modes": {
+    "oracle_context": "Use provided CONTEXTS directly (comparable to leaderboard)",
+    "rag_retrieval": "Retrieve contexts via RAG pipeline (harder, your contribution)"
   },
-  "random_seed": 42,
-  "notes": [
-    "All contexts are indexed for retrieval",
-    "Answers (long_answer, final_decision) are NOT indexed",
-    "Test set is held out for fair evaluation",
-    "Dev set is for hyperparameter tuning"
-  ]
+  "random_seed": 42
 }

@@ -51,11 +51,15 @@ def estimate_tokens(text: str) -> int:
 from mega_rag.config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    GROQ_MAX_TOKENS,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     OLLAMA_MAX_TOKENS,
     LLM_PROVIDER,
-    LLM_AUTO_FALLBACK
+    LLM_AUTO_FALLBACK,
+    LLM_FALLBACK_CHAIN,
 )
 
 
@@ -634,6 +638,149 @@ class OllamaLLM(BaseLLM):
 
 
 # =============================================================================
+# Groq LLM (Cloud - Free Tier)
+# =============================================================================
+
+class GroqLLM(BaseLLM):
+    """
+    Groq Cloud LLM integration with built-in rate limiting.
+    Free tier: 30 RPM, 14,400 RPD — ultra-fast inference on custom LPU hardware.
+
+    Rate limiter ensures we stay under 28 RPM (safe margin below 30 RPM limit).
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model_name: str = GROQ_MODEL,
+        temperature: float = 0.3,
+        max_tokens: int = GROQ_MAX_TOKENS,
+        max_rpm: int = 28,  # Stay below 30 RPM limit
+    ):
+        super().__init__()
+        self.api_key = api_key or GROQ_API_KEY or os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "Groq API key not found. Set GROQ_API_KEY in .env or environment.\n"
+                "Get a free key at: https://console.groq.com/keys"
+            )
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+
+        # Rate limiter: track call timestamps in a sliding window
+        import collections
+        self._call_times = collections.deque()
+        self._max_rpm = max_rpm
+        self._min_interval = 60.0 / max_rpm  # ~2.14s between calls at 28 RPM
+
+        print(f"✓ Groq LLM initialized: {model_name} (rate limit: {max_rpm} RPM)")
+
+    def _wait_for_rate_limit(self):
+        """Block until we're safe to make the next API call."""
+        import time as _time
+
+        now = _time.time()
+
+        # Remove calls older than 60 seconds
+        while self._call_times and now - self._call_times[0] > 60:
+            self._call_times.popleft()
+
+        # If we've hit the RPM limit, wait until the oldest call expires
+        if len(self._call_times) >= self._max_rpm:
+            wait_until = self._call_times[0] + 60.0
+            sleep_time = wait_until - now + 0.1  # +0.1s buffer
+            if sleep_time > 0:
+                print(f"  [Rate limit] {len(self._call_times)}/{self._max_rpm} RPM — waiting {sleep_time:.1f}s")
+                _time.sleep(sleep_time)
+
+        # Also enforce minimum interval between consecutive calls
+        if self._call_times:
+            elapsed = now - self._call_times[-1]
+            if elapsed < self._min_interval:
+                _time.sleep(self._min_interval - elapsed)
+
+        self._call_times.append(_time.time())
+
+    def generate(self, prompt: str) -> str:
+        """Generate response from Groq API with rate limiting."""
+        self._wait_for_rate_limit()
+        try:
+            response = requests.post(
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                },
+                timeout=60,
+            )
+
+            if response.status_code == 429:
+                raise RateLimitError(f"Groq rate limit hit: {response.text}")
+
+            if response.status_code != 200:
+                return f"Groq error: {response.status_code} - {response.text}"
+
+            data = response.json()
+            result = data["choices"][0]["message"]["content"]
+
+            # Track token usage from response
+            usage = data.get("usage", {})
+            self._track_usage(
+                usage.get("prompt_tokens", estimate_tokens(prompt)),
+                usage.get("completion_tokens", estimate_tokens(result)),
+            )
+            return result
+
+        except RateLimitError:
+            raise
+        except requests.exceptions.Timeout:
+            return "Error: Groq request timed out."
+        except requests.exceptions.RequestException as e:
+            return f"Error connecting to Groq: {str(e)}"
+
+    def generate_answer(
+        self,
+        question: str,
+        context_chunks: List[str],
+        source_metadata: Optional[List[dict]] = None,
+        system_instruction: Optional[str] = None,
+        debug: bool = False,
+    ) -> str:
+        """Generate answer using Groq with medical context."""
+        prompt = self._build_medical_prompt(
+            question, context_chunks, source_metadata, system_instruction,
+            max_context_chars=12000,
+        )
+
+        if debug:
+            prompt_tokens = estimate_tokens(prompt)
+            print(f"\n[DEBUG GROQ] Model: {self.model_name}")
+            print(f"[DEBUG GROQ] Prompt tokens (est): {prompt_tokens:,}")
+            print(f"[DEBUG GROQ] Context chunks: {len(context_chunks)}")
+
+        response = self.generate(prompt)
+
+        if debug:
+            print(f"[DEBUG GROQ] Response length: {len(response)} chars")
+            import re
+            final_match = re.search(r'final\s*answer\s*[:\s]*\b(yes|no|maybe)\b', response.lower())
+            if final_match:
+                print(f"[DEBUG GROQ] ✓ Found 'Final Answer': {final_match.group(1)}")
+            else:
+                print("[DEBUG GROQ] ✗ NO 'Final Answer' pattern found!")
+
+        return response
+
+
+# =============================================================================
 # Rate Limit Error
 # =============================================================================
 
@@ -642,144 +789,190 @@ class RateLimitError(Exception):
     pass
 
 
+def retry_with_backoff(func, max_retries=3, base_delay=5):
+    """Retry a function with exponential backoff on rate limit errors.
+
+    Waits base_delay * 2^attempt seconds between retries.
+    Used during evaluation to handle per-minute API rate limits gracefully.
+    """
+    import time as _time
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(f"  Rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
+            _time.sleep(delay)
+
+
 # =============================================================================
 # Unified LLM with Auto-Fallback
 # =============================================================================
 
 class UnifiedLLM(BaseLLM):
     """
-    Unified LLM that supports both Gemini and Ollama with auto-fallback.
+    Multi-provider LLM with automatic fallback chain.
 
-    When Gemini hits rate limits (429), automatically switches to local Ollama.
+    Supports any combination of: Gemini, Groq, Ollama.
+    When one provider fails (rate limit, error, unavailable), automatically
+    tries the next one in the chain.
+
+    Fallback chain is configurable via:
+      - LLM_FALLBACK_CHAIN env var (e.g., "gemini,groq,ollama")
+      - Or pass fallback_chain parameter directly
+
+    Examples:
+      LLM_PROVIDER=auto   → tries gemini → groq → ollama
+      LLM_PROVIDER=gemini → uses gemini, falls back per LLM_FALLBACK_CHAIN
+      LLM_PROVIDER=groq   → uses groq only (no fallback unless LLM_AUTO_FALLBACK=true)
     """
+
+    # Maps provider name → class
+    PROVIDER_CLASSES = {
+        "gemini": GeminiLLM,
+        "groq": GroqLLM,
+        "ollama": OllamaLLM,
+    }
 
     def __init__(
         self,
         primary_provider: str = LLM_PROVIDER,
-        auto_fallback: bool = LLM_AUTO_FALLBACK
+        auto_fallback: bool = LLM_AUTO_FALLBACK,
+        fallback_chain: Optional[List[str]] = None,
     ):
-        super().__init__()  # Initialize token tracking
-        self.primary_provider = primary_provider
+        super().__init__()
         self.auto_fallback = auto_fallback
-        self.current_provider = primary_provider
-        self._fallback_active = False
+        self._active_index = 0
 
-        # Initialize primary LLM
-        self.primary_llm = None
-        self.fallback_llm = None
+        # Build the provider chain
+        if primary_provider == "auto":
+            chain = fallback_chain or LLM_FALLBACK_CHAIN
+        elif auto_fallback:
+            # Primary first, then the rest of the fallback chain (without duplicates)
+            rest = [p for p in (fallback_chain or LLM_FALLBACK_CHAIN) if p != primary_provider]
+            chain = [primary_provider] + rest
+        else:
+            chain = [primary_provider]
 
-        if primary_provider == "gemini":
+        # Initialize each provider in the chain (skip failures)
+        self._providers: List[tuple[str, BaseLLM]] = []
+        for name in chain:
+            name = name.strip()
+            cls = self.PROVIDER_CLASSES.get(name)
+            if cls is None:
+                print(f"  ⚠ Unknown provider '{name}', skipping")
+                continue
             try:
-                self.primary_llm = GeminiLLM()
-            except ValueError as e:
-                print(f"⚠ Gemini initialization failed: {e}")
-                if auto_fallback:
-                    print("  Switching to Ollama as primary...")
-                    primary_provider = "ollama"
+                llm = cls()
+                self._providers.append((name, llm))
+            except (ValueError, ConnectionError, Exception) as e:
+                print(f"  ⚠ {name} unavailable: {e}")
 
-        if primary_provider == "ollama" or self.primary_llm is None:
-            try:
-                self.primary_llm = OllamaLLM()
-                self.primary_provider = "ollama"
-            except ConnectionError as e:
-                if self.primary_llm is None:
-                    raise ValueError(
-                        "No LLM available. Either set GEMINI_API_KEY or start Ollama server."
-                    )
+        if not self._providers:
+            raise ValueError(
+                "No LLM providers available. Set at least one of:\n"
+                "  - GEMINI_API_KEY (free: https://aistudio.google.com/apikey)\n"
+                "  - GROQ_API_KEY   (free: https://console.groq.com/keys)\n"
+                "  - Ollama running (https://ollama.ai)"
+            )
 
-        # Initialize fallback LLM (if using Gemini as primary)
-        if self.primary_provider == "gemini" and auto_fallback:
-            try:
-                self.fallback_llm = OllamaLLM()
-                print("  Fallback: Ollama (local) ready")
-            except ConnectionError:
-                print("  ⚠ Ollama not available for fallback")
+        active_name, _ = self._providers[0]
+        fallback_names = [n for n, _ in self._providers[1:]]
+        print(f"  Active: {active_name}" + (f" | Fallbacks: {', '.join(fallback_names)}" if fallback_names else ""))
+
+    def _get_active(self) -> tuple[str, BaseLLM]:
+        """Get the currently active provider."""
+        return self._providers[self._active_index]
+
+    def _try_next_fallback(self, error_msg: str) -> bool:
+        """Try to switch to the next provider in the chain. Returns True if switched."""
+        if not self.auto_fallback:
+            return False
+        next_idx = self._active_index + 1
+        if next_idx >= len(self._providers):
+            return False
+        self._active_index = next_idx
+        name, _ = self._providers[next_idx]
+        print(f"\n  ⚠ {error_msg}")
+        print(f"  → Falling back to: {name}")
+        return True
 
     @property
     def last_usage(self) -> TokenUsage:
-        """Get token usage from the active LLM's last call."""
-        if self._fallback_active and self.fallback_llm:
-            return self.fallback_llm.last_usage
-        return self.primary_llm.last_usage
+        _, llm = self._get_active()
+        return llm.last_usage
 
     @property
     def total_usage(self) -> TokenUsage:
-        """Get cumulative token usage from active LLM."""
-        if self._fallback_active and self.fallback_llm:
-            return self.fallback_llm.total_usage
-        return self.primary_llm.total_usage
+        _, llm = self._get_active()
+        return llm.total_usage
 
     def get_usage_summary(self) -> dict:
-        """Get combined usage summary from both LLMs."""
-        primary_usage = self.primary_llm.get_usage_summary() if self.primary_llm else {}
-        fallback_usage = self.fallback_llm.get_usage_summary() if self.fallback_llm else {}
-
+        summaries = {}
+        for name, llm in self._providers:
+            summaries[name] = llm.get_usage_summary()
+        active_name, _ = self._get_active()
         return {
-            'primary': primary_usage,
-            'fallback': fallback_usage,
-            'active_provider': self.active_provider,
-            'fallback_active': self._fallback_active
+            'providers': summaries,
+            'active_provider': active_name,
+            'active_index': self._active_index,
+            'chain': [n for n, _ in self._providers],
         }
 
     def generate(self, prompt: str) -> str:
-        """Generate response with auto-fallback on rate limits."""
-        # If fallback is already active, use it directly
-        if self._fallback_active and self.fallback_llm:
-            return self.fallback_llm.generate(prompt)
+        """Generate with retry + automatic fallback through the provider chain.
 
-        try:
-            return self.primary_llm.generate(prompt)
-        except RateLimitError as e:
-            if self.auto_fallback and self.fallback_llm:
-                if not self._fallback_active:
-                    print(f"\n⚠ {e}")
-                    print("  → Switching to local Ollama model...")
-                    self._fallback_active = True
-                return self.fallback_llm.generate(prompt)
-            else:
-                return f"Rate limit error: {str(e)}"
+        On rate limit: retries 3 times with exponential backoff (5s, 10s, 20s).
+        If still failing, falls back to the next provider in the chain.
+        """
+        while True:
+            name, llm = self._get_active()
+            try:
+                return retry_with_backoff(lambda: llm.generate(prompt))
+            except RateLimitError as e:
+                if not self._try_next_fallback(str(e)):
+                    return f"All providers exhausted. Last error: {e}"
+            except Exception as e:
+                if not self._try_next_fallback(str(e)):
+                    return f"All providers exhausted. Last error: {e}"
 
     def generate_answer(
         self,
         question: str,
         context_chunks: List[str],
         source_metadata: Optional[List[dict]] = None,
-        system_instruction: Optional[str] = None
+        system_instruction: Optional[str] = None,
     ) -> str:
-        """Generate answer with auto-fallback on rate limits."""
-        # If fallback is already active, use it directly
-        if self._fallback_active and self.fallback_llm:
-            return self.fallback_llm.generate_answer(
-                question, context_chunks, source_metadata, system_instruction
-            )
-
-        try:
-            return self.primary_llm.generate_answer(
-                question, context_chunks, source_metadata, system_instruction
-            )
-        except RateLimitError as e:
-            if self.auto_fallback and self.fallback_llm:
-                if not self._fallback_active:
-                    print(f"\n⚠ {e}")
-                    print("  → Switching to local Ollama model...")
-                    self._fallback_active = True
-                return self.fallback_llm.generate_answer(
-                    question, context_chunks, source_metadata, system_instruction
+        """Generate answer with retry + automatic fallback through the provider chain."""
+        while True:
+            name, llm = self._get_active()
+            try:
+                return retry_with_backoff(
+                    lambda: llm.generate_answer(
+                        question, context_chunks, source_metadata, system_instruction
+                    )
                 )
-            else:
-                return f"Rate limit error: {str(e)}"
+            except RateLimitError as e:
+                if not self._try_next_fallback(str(e)):
+                    return f"All providers exhausted. Last error: {e}"
+            except Exception as e:
+                if not self._try_next_fallback(str(e)):
+                    return f"All providers exhausted. Last error: {e}"
 
     def reset_fallback(self):
-        """Reset to primary provider (useful after rate limit window passes)."""
-        self._fallback_active = False
-        print(f"  → Reset to primary provider: {self.primary_provider}")
+        """Reset to the first provider in the chain."""
+        self._active_index = 0
+        name, _ = self._get_active()
+        print(f"  → Reset to primary provider: {name}")
 
     @property
     def active_provider(self) -> str:
-        """Get the currently active provider."""
-        if self._fallback_active:
-            return "ollama (fallback)"
-        return self.primary_provider
+        name, _ = self._get_active()
+        if self._active_index > 0:
+            return f"{name} (fallback)"
+        return name
 
 
 # =============================================================================
@@ -791,23 +984,28 @@ def create_llm(provider: Optional[str] = None) -> BaseLLM:
     Factory function to create the appropriate LLM.
 
     Args:
-        provider: "gemini", "ollama", or None (uses config default)
+        provider: "gemini", "groq", "ollama", "auto", or None (uses config).
 
     Returns:
         BaseLLM instance
+
+    Examples:
+        create_llm()           → uses LLM_PROVIDER from config (default: "auto")
+        create_llm("gemini")   → Gemini with auto-fallback chain
+        create_llm("groq")     → Groq with auto-fallback chain
+        create_llm("ollama")   → Local Ollama only (no fallback)
     """
     provider = provider or LLM_PROVIDER
 
-    if provider == "gemini":
-        if LLM_AUTO_FALLBACK:
-            return UnifiedLLM(primary_provider="gemini")
-        return GeminiLLM()
-    elif provider == "ollama":
-        return OllamaLLM()
-    elif provider == "auto":
-        return UnifiedLLM()
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
+    # Direct provider without fallback (when auto_fallback is off)
+    if not LLM_AUTO_FALLBACK and provider != "auto":
+        cls = UnifiedLLM.PROVIDER_CLASSES.get(provider)
+        if cls is None:
+            raise ValueError(f"Unknown LLM provider: {provider}")
+        return cls()
+
+    # Use UnifiedLLM for fallback chain support
+    return UnifiedLLM(primary_provider=provider)
 
 
 # =============================================================================

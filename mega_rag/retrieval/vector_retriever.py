@@ -84,20 +84,36 @@ class VectorRetriever:
         )
 
     def add_documents(self, documents: List[Document]) -> None:
-        """Add documents to the vector store with GPU memory management."""
+        """Add documents to the vector store with GPU memory management.
+
+        If a document has `contextualized_content`, that text is used for
+        embedding (better retrieval), while the raw `content` is stored in
+        ChromaDB (shown to the LLM at generation time).
+        """
         if not documents:
             return
 
         # Prepare data for ChromaDB
         ids = []
-        texts = []
+        texts = []          # Raw content — stored in ChromaDB, shown to LLM
+        embed_texts = []     # Contextualized content — used for embedding only
         metadatas = []
 
+        contextualized_count = 0
         for doc in documents:
             doc_unique_id = f"{doc.doc_id}_{doc.chunk_id}"
             ids.append(doc_unique_id)
             texts.append(doc.content)
+            # Use contextualized content for embedding if available
+            if getattr(doc, "contextualized_content", None):
+                embed_texts.append(doc.contextualized_content)
+                contextualized_count += 1
+            else:
+                embed_texts.append(doc.content)
             metadatas.append(doc.metadata)
+
+        if contextualized_count > 0:
+            print(f"  Using contextualized embeddings for {contextualized_count}/{len(texts)} chunks")
 
         # Generate embeddings in batches to avoid OOM
         print(f"Generating embeddings for {len(texts)} documents...")
@@ -105,8 +121,8 @@ class VectorRetriever:
         all_embeddings = []
 
         try:
-            for i in tqdm(range(0, len(texts), embed_batch_size), desc="Embedding"):
-                batch_texts = texts[i:i + embed_batch_size]
+            for i in tqdm(range(0, len(embed_texts), embed_batch_size), desc="Embedding"):
+                batch_texts = embed_texts[i:i + embed_batch_size]
                 batch_embeddings = self.embedding_model.encode(
                     batch_texts,
                     show_progress_bar=False,
@@ -122,8 +138,8 @@ class VectorRetriever:
                 self.embedding_model = self.embedding_model.to("cpu")
                 self.device = "cpu"
                 all_embeddings = []
-                for i in tqdm(range(0, len(texts), 32), desc="Embedding (CPU)"):
-                    batch_texts = texts[i:i + 32]
+                for i in tqdm(range(0, len(embed_texts), 32), desc="Embedding (CPU)"):
+                    batch_texts = embed_texts[i:i + 32]
                     batch_embeddings = self.embedding_model.encode(
                         batch_texts,
                         show_progress_bar=False,

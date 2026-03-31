@@ -1,0 +1,65 @@
+# =============================================================================
+# MEGA-RAG .gitignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment / Secrets
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data & Models (large files)
+chroma_db/
+chroma_pubmedqa_only/
+*.pkl
+*.parquet
+data/
+
+# Evaluation outputs (keep the scripts, not the results)
+evaluation_results/
+logs/
+
+# Kaggle temp directories
+kaggle_dataset_tmp/
+kaggle_kernel_tmp/
+kaggle_output/
+
+# LoRA adapters (large, download from Kaggle/HF)
+lora-adapter/
+llama31-pubmedqa-lora/
+
+# Node modules (frontend)
+node_modules/
+frontend/dist/
+frontend/build/
+
+# OS files
+Thumbs.db
+.Trash-*
