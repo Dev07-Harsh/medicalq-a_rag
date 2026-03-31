@@ -45,14 +45,14 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 # Free tier: 30 RPM, 14,400 RPD, 6,000 TPM
 # Get API key: https://console.groq.com/keys
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # Default 8B: 500K TPD. Set to llama-3.3-70b-versatile for quality
 # Available free models:
 #   - "llama-3.3-70b-versatile"       (best quality, 6K TPM)
 #   - "deepseek-r1-distill-llama-70b" (strong reasoning)
 #   - "llama-3.1-8b-instant"          (fastest, 6K TPM)
 #   - "gemma2-9b-it"                  (good balance, 15K TPM)
 #   - "mixtral-8x7b-32768"            (32K context, 5K TPM)
-GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "1024"))
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "512"))  # Reduced to conserve daily token quota
 
 # =============================================================================
 # OLLAMA CONFIGURATION (Local Models)
@@ -104,7 +104,7 @@ ENABLE_CONTEXTUAL_CHUNKING = os.getenv("ENABLE_CONTEXTUAL_CHUNKING", "true").low
 VECTOR_TOP_K = 30  
 BM25_TOP_K = 30    
 GRAPH_TOP_K = 5    # Graph ENABLED (Reduced from 8 to reduce noise)
-RERANK_TOP_K = 15   # Increased to 15 to capture relevant docs at rank 10+
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "6"))  # Chunks sent to LLM after reranking (lower = less tokens)
 
 # Cross-Encoder Configuration
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"

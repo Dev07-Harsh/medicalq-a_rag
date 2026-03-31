@@ -755,9 +755,13 @@ class GroqLLM(BaseLLM):
         debug: bool = False,
     ) -> str:
         """Generate answer using Groq with medical context."""
+        # Use smaller context to conserve daily token quota
+        # 70B model: 100K TPD limit → ~4000 chars/call
+        # 8B model: 500K TPD limit → ~8000 chars/call
+        max_chars = 4000 if "70b" in self.model_name else 8000
         prompt = self._build_medical_prompt(
             question, context_chunks, source_metadata, system_instruction,
-            max_context_chars=12000,
+            max_context_chars=max_chars,
         )
 
         if debug:
